@@ -75,6 +75,14 @@ func (t *Table) Commit(expectParent string, batch Batch) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// 跨进程互斥：多个实例/脚本同时打开同一张表时，
+	// 整个提交临界区只有一个提交者，其余在重读 HEAD 时被冲突检测拒绝。
+	lk, err := t.store.lock(t.name)
+	if err != nil {
+		return "", err
+	}
+	defer lk.unlock()
+
 	head, err := t.store.readHead(t.name)
 	if err != nil {
 		return "", err
@@ -113,9 +121,13 @@ func (t *Table) Commit(expectParent string, batch Batch) (string, error) {
 		BatchID:   batch.BatchID,
 		CreatedAt: time.Now().UnixNano(),
 	}
-	// 先写数据文件与快照元数据，最后 CAS 推进 HEAD：
+	// 先写数据文件、行级变更明细与快照元数据，最后 CAS 推进 HEAD：
 	// HEAD 之前的任何失败都不会产生可见的中间状态。
 	if err := t.store.writeData(t.name, snap.DataFile, merged); err != nil {
+		return "", err
+	}
+	recs := changeRecords(base, parent.Schema, batch, snap.ID, snap.Seq)
+	if err := t.store.writeChanges(t.name, snap.ID, recs); err != nil {
 		return "", err
 	}
 	if err := t.store.writeSnapshot(t.name, snap); err != nil {
@@ -139,6 +151,12 @@ func (t *Table) Commit(expectParent string, batch Batch) (string, error) {
 func (t *Table) EvolveSchema(newSchema Schema) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	lk, err := t.store.lock(t.name)
+	if err != nil {
+		return "", err
+	}
+	defer lk.unlock()
 
 	head, err := t.store.readHead(t.name)
 	if err != nil {
@@ -173,6 +191,10 @@ func (t *Table) EvolveSchema(newSchema Schema) (string, error) {
 	if err := t.store.writeData(t.name, snap.DataFile, projected); err != nil {
 		return "", err
 	}
+	// 结构演进快照无行级业务变更，显式写空明细，便于增量消费统一处理。
+	if err := t.store.writeChanges(t.name, snap.ID, []ChangeRecord{}); err != nil {
+		return "", err
+	}
 	if err := t.store.writeSnapshot(t.name, snap); err != nil {
 		return "", err
 	}
@@ -182,6 +204,72 @@ func (t *Table) EvolveSchema(newSchema Schema) (string, error) {
 	}
 	if !ok {
 		return "", fmt.Errorf("%w: head moved during schema evolution", ErrCommitConflict)
+	}
+	return snap.ID, nil
+}
+
+// RenameColumn 带数据的列改名迁移：生成一个新快照，
+// 新列名下保留改名前的全部历史值，同一行其他列不受影响。
+// 改名后旧快照仍按当时的结构与值读取，结果可复现。
+// 不允许改主键列、不允许新列名与既有列冲突（ErrSchemaIncompatible）。
+func (t *Table) RenameColumn(from, to string) (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	lk, err := t.store.lock(t.name)
+	if err != nil {
+		return "", err
+	}
+	defer lk.unlock()
+
+	head, err := t.store.readHead(t.name)
+	if err != nil {
+		return "", err
+	}
+	parent, err := t.store.readSnapshot(t.name, head)
+	if err != nil {
+		return "", err
+	}
+	if err := checkRename(parent.Schema, from, to); err != nil {
+		return "", err
+	}
+	newSchema := renameColumnInSchema(parent.Schema, from, to)
+
+	base, err := t.store.readData(t.name, parent.DataFile)
+	if err != nil {
+		return "", err
+	}
+	migrated := make([]Row, 0, len(base))
+	for _, r := range base {
+		migrated = append(migrated, renameColumnInRow(r, from, to))
+	}
+	migrated = sortRows(migrated, newSchema.PrimaryKey)
+
+	snap := &Snapshot{
+		ID:        snapshotID(parent.Seq + 1),
+		Seq:       parent.Seq + 1,
+		ParentID:  head,
+		Schema:    newSchema,
+		DataFile:  snapshotID(parent.Seq+1) + ".json",
+		BatchID:   "", // 结构迁移快照，无数据批次
+		CreatedAt: time.Now().UnixNano(),
+	}
+	if err := t.store.writeData(t.name, snap.DataFile, migrated); err != nil {
+		return "", err
+	}
+	// 列改名迁移快照无行级业务变更，显式写空明细。
+	if err := t.store.writeChanges(t.name, snap.ID, []ChangeRecord{}); err != nil {
+		return "", err
+	}
+	if err := t.store.writeSnapshot(t.name, snap); err != nil {
+		return "", err
+	}
+	ok, err := t.store.compareAndSwapHead(t.name, head, snap.ID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("%w: head moved during column rename", ErrCommitConflict)
 	}
 	return snap.ID, nil
 }
@@ -236,6 +324,30 @@ func (t *Table) ReadSince(sinceSeq uint64) ([]Snapshot, error) {
 		if s.Seq > sinceSeq {
 			out = append(out, *s)
 		}
+	}
+	return out, nil
+}
+
+// ReadChangesSince 增量读取行级变更明细：返回 Seq 大于 sinceSeq 的各快照
+// 中真实发生的行级变更（insert/update/delete + 主键 + 变更后整行），
+// 按快照序号与批次内顺序稳定输出。重复执行结果一致；
+// 断点续读时传入已消费的最大 Seq，只会返回未消费的部分。
+// 结构演进/列改名快照不产生行级变更记录。
+func (t *Table) ReadChangesSince(sinceSeq uint64) ([]ChangeRecord, error) {
+	snaps, err := t.store.listSnapshots(t.name)
+	if err != nil {
+		return nil, err
+	}
+	var out []ChangeRecord
+	for _, s := range snaps {
+		if s.Seq <= sinceSeq {
+			continue
+		}
+		recs, err := t.store.readChanges(t.name, s.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, recs...)
 	}
 	return out, nil
 }

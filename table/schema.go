@@ -67,6 +67,55 @@ func projectRow(row Row, newS Schema) Row {
 	return out
 }
 
+// checkRename 校验列改名是否合法：
+// 旧列必须存在、新列名必须未被占用、不允许改主键列；类型随列一起迁移，保持不变。
+func checkRename(s Schema, from, to string) error {
+	if from == "" || to == "" {
+		return fmt.Errorf("%w: rename column name is empty", ErrSchemaIncompatible)
+	}
+	if from == s.PrimaryKey {
+		return fmt.Errorf("%w: cannot rename primary key column %q", ErrSchemaIncompatible, from)
+	}
+	fromFound := false
+	for _, c := range s.Columns {
+		if c.Name == from {
+			fromFound = true
+		}
+		if c.Name == to {
+			return fmt.Errorf("%w: target column %q already exists", ErrSchemaIncompatible, to)
+		}
+	}
+	if !fromFound {
+		return fmt.Errorf("%w: column %q not found", ErrSchemaIncompatible, from)
+	}
+	return nil
+}
+
+// renameColumnInSchema 返回把列 from 改名为 to 之后的新结构（位置、类型、缺省值不变）。
+func renameColumnInSchema(s Schema, from, to string) Schema {
+	out := Schema{PrimaryKey: s.PrimaryKey, Columns: make([]Column, len(s.Columns))}
+	for i, c := range s.Columns {
+		if c.Name == from {
+			c.Name = to
+		}
+		out.Columns[i] = c
+	}
+	return out
+}
+
+// renameColumnInRow 把一行数据中的 from 键值搬到 to 键，其余列原样保留。
+func renameColumnInRow(row Row, from, to string) Row {
+	out := make(Row, len(row))
+	for k, v := range row {
+		if k == from {
+			out[to] = v
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // validateChange 校验单条变更与结构匹配。
 func validateChange(s Schema, ch Change) error {
 	switch {

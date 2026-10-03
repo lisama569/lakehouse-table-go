@@ -69,6 +69,47 @@ func applyBatch(base []Row, schema Schema, batch Batch) []Row {
 	return sortRows(merged, schema.PrimaryKey)
 }
 
+// changeRecords 依据（基线, 批次）推导本批次真实发生的行级变更明细，
+// 顺序与变更在批次中的出现顺序一致，结果确定且可复现：
+//   - Upsert 的主键在基线（含本批次此前变更）中不存在 → insert，否则 → update；
+//   - Delete 仅当主键存在时产生一条 delete 记录（删除不存在的行不算变更）；
+//   - 记录中的 Row 为变更后的整行（缺省列已补齐）；delete 记录只带主键。
+func changeRecords(base []Row, schema Schema, batch Batch, snapID string, seq uint64) []ChangeRecord {
+	existing := map[string]bool{}
+	for _, r := range base {
+		if pk, ok := r[schema.PrimaryKey]; ok {
+			existing[pkKey(pk)] = true
+		}
+	}
+	var recs []ChangeRecord
+	for _, ch := range batch.Changes {
+		switch {
+		case ch.Upsert != nil:
+			row := projectRow(*ch.Upsert, schema)
+			k := pkKey(row[schema.PrimaryKey])
+			op := OpInsert
+			if existing[k] {
+				op = OpUpdate
+			}
+			existing[k] = true
+			recs = append(recs, ChangeRecord{
+				Seq: seq, SnapshotID: snapID, Op: op,
+				Key: row[schema.PrimaryKey], Row: row,
+			})
+		case ch.Delete != nil:
+			k := pkKey(*ch.Delete)
+			if existing[k] {
+				delete(existing, k)
+				recs = append(recs, ChangeRecord{
+					Seq: seq, SnapshotID: snapID, Op: OpDelete,
+					Key: *ch.Delete,
+				})
+			}
+		}
+	}
+	return recs
+}
+
 // sortRows 按主键排序，保证读取结果可复现。
 func sortRows(rows []Row, pk string) []Row {
 	out := make([]Row, len(rows))

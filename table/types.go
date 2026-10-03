@@ -52,3 +52,21 @@ type Snapshot struct {
 	BatchID   string   `json:"batch_id"` // 产生本快照的批次；结构演进时为空
 	CreatedAt int64    `json:"created_at"`
 }
+
+// ChangeOp 行级变更类型。
+type ChangeOp string
+
+const (
+	OpInsert ChangeOp = "insert" // 新增行
+	OpUpdate ChangeOp = "update" // 覆盖既有行
+	OpDelete ChangeOp = "delete" // 删除行
+)
+
+// ChangeRecord 一条真实发生的行级变更记录，随快照持久化，按发生顺序输出。
+type ChangeRecord struct {
+	Seq        uint64   `json:"seq"`
+	SnapshotID string   `json:"snapshot_id"`
+	Op         ChangeOp `json:"op"`
+	Key        Value    `json:"key"`           // 涉及行的主键值
+	Row        Row      `json:"row,omitempty"` // 变更后的整行列值；删除时为空（按主键作删除标记）
+}
