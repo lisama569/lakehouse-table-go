@@ -42,13 +42,48 @@ type Batch struct {
 	Changes []Change `json:"changes"`
 }
 
+// RowChangeKind 行级变更类型。
+type RowChangeKind string
+
+const (
+	// RowInserted 新增行。
+	RowInserted RowChangeKind = "insert"
+	// RowUpdated 更新已有行。
+	RowUpdated RowChangeKind = "update"
+	// RowDeleted 删除行（墓碑事件，只带主键）。
+	RowDeleted RowChangeKind = "delete"
+)
+
+// ColumnRename 记录一次带数据的列改名迁移。
+type ColumnRename struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// RowChange 快照内的一条行级变更（按发生顺序编号）。
+type RowChange struct {
+	Seq   uint64        `json:"seq"`           // 所属快照序号
+	Order int           `json:"order"`         // 在快照内的发生顺序
+	Kind  RowChangeKind `json:"kind"`          // insert / update / delete
+	PK    Value         `json:"pk"`            // 主键值
+	Row   Row           `json:"row,omitempty"` // 变更后的整行；delete 时为空
+}
+
+// SnapshotChanges 一次增量读取单元：快照推进信息 + 该快照的行级变更。
+type SnapshotChanges struct {
+	Snapshot Snapshot    `json:"snapshot"`
+	Changes  []RowChange `json:"changes"`
+}
+
 // Snapshot 一个不可变快照的元数据。
 type Snapshot struct {
-	ID        string   `json:"id"`
-	Seq       uint64   `json:"seq"`
-	ParentID  string   `json:"parent_id"`
-	Schema    Schema   `json:"schema"`
-	DataFile  string   `json:"data_file"`
-	BatchID   string   `json:"batch_id"` // 产生本快照的批次；结构演进时为空
-	CreatedAt int64    `json:"created_at"`
+	ID         string        `json:"id"`
+	Seq        uint64        `json:"seq"`
+	ParentID   string        `json:"parent_id"`
+	Schema     Schema        `json:"schema"`
+	DataFile   string        `json:"data_file"`
+	ChangeFile string        `json:"change_file,omitempty"` // 行级变更流水文件
+	BatchID    string        `json:"batch_id"`              // 产生本快照的批次；结构演进时为空
+	Rename     *ColumnRename `json:"rename,omitempty"`      // 带数据列改名迁移标记
+	CreatedAt  int64         `json:"created_at"`
 }

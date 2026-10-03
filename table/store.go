@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Store 本地文件系统存储：负责表元数据与数据文件的读写。
@@ -25,15 +26,49 @@ func NewStore(root string) *Store {
 	return &Store{root: root}
 }
 
-func (s *Store) tableDir(name string) string  { return filepath.Join(s.root, name) }
-func (s *Store) metaDir(name string) string   { return filepath.Join(s.tableDir(name), "meta") }
-func (s *Store) dataDir(name string) string   { return filepath.Join(s.tableDir(name), "data") }
-func (s *Store) headPath(name string) string  { return filepath.Join(s.metaDir(name), "HEAD") }
-func (s *Store) batchDir(name string) string  { return filepath.Join(s.metaDir(name), "batches") }
-func (s *Store) snapDir(name string) string   { return filepath.Join(s.metaDir(name), "snapshots") }
+func (s *Store) tableDir(name string) string { return filepath.Join(s.root, name) }
+func (s *Store) metaDir(name string) string  { return filepath.Join(s.tableDir(name), "meta") }
+func (s *Store) dataDir(name string) string  { return filepath.Join(s.tableDir(name), "data") }
+func (s *Store) headPath(name string) string { return filepath.Join(s.metaDir(name), "HEAD") }
+func (s *Store) batchDir(name string) string { return filepath.Join(s.metaDir(name), "batches") }
+func (s *Store) snapDir(name string) string  { return filepath.Join(s.metaDir(name), "snapshots") }
 
 func (s *Store) snapPath(table, id string) string {
 	return filepath.Join(s.snapDir(table), id+".json")
+}
+
+// changePath 返回快照行级变更流水文件路径。
+func (s *Store) changePath(table, file string) string {
+	return filepath.Join(s.snapDir(table), file)
+}
+
+// writeChanges 持久化快照的行级变更流水（不可变，随快照一起落盘）。
+func (s *Store) writeChanges(table, file string, changes []RowChange) error {
+	b, err := json.Marshal(changes)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(s.changePath(table, file), b)
+}
+
+// readChanges 读取快照的行级变更流水；流水文件不存在时返回 nil
+// （初始快照以及无结构变更的演进快照都没有行级变更）。
+func (s *Store) readChanges(table, file string) ([]RowChange, error) {
+	if file == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(s.changePath(table, file))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var changes []RowChange
+	if err := json.Unmarshal(b, &changes); err != nil {
+		return nil, err
+	}
+	return changes, nil
 }
 
 func (s *Store) dataPath(table, file string) string {
@@ -156,7 +191,9 @@ func (s *Store) listSnapshots(table string) ([]*Snapshot, error) {
 	}
 	var snaps []*Snapshot
 	for _, e := range entries {
-		if filepath.Ext(e.Name()) != ".json" {
+		// 只取快照元数据文件（snap-xxxxxx.json），跳过 *.changes.json 流水文件。
+		if !strings.HasPrefix(e.Name(), "snap-") || !strings.HasSuffix(e.Name(), ".json") ||
+			strings.HasSuffix(e.Name(), ".changes.json") {
 			continue
 		}
 		snap, err := s.readSnapshot(table, e.Name()[:len(e.Name())-len(".json")])
