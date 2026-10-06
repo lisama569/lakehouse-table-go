@@ -69,16 +69,57 @@ func applyBatch(base []Row, schema Schema, batch Batch) []Row {
 	return sortRows(merged, schema.PrimaryKey)
 }
 
+// valueEqual 比较两个单元格值是否相等。
+// 数值做跨类型归一：基线行从 JSON 读回后整数变为 float64，
+// 与提交方传入的 int64/int 应视为同值，否则原样重复提交会被误判为更新。
+func valueEqual(a, b Value) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if fa, ok := toNumber(a); ok {
+		fb, ok2 := toNumber(b)
+		return ok2 && fa == fb
+	}
+	return a == b
+}
+
+func toNumber(v Value) (float64, bool) {
+	switch x := v.(type) {
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case float64:
+		return x, true
+	}
+	return 0, false
+}
+
+// rowsEqual 按结构逐列比较两行是否完全一致（两行均已按结构投影，列集合相同）。
+func rowsEqual(a, b Row, schema Schema) bool {
+	for _, c := range schema.Columns {
+		if !valueEqual(a[c.Name], b[c.Name]) {
+			return false
+		}
+	}
+	return true
+}
+
 // changeRecords 依据（基线, 批次）推导本批次真实发生的行级变更明细，
 // 顺序与变更在批次中的出现顺序一致，结果确定且可复现：
-//   - Upsert 的主键在基线（含本批次此前变更）中不存在 → insert，否则 → update；
+//   - Upsert 的主键在基线（含本批次此前变更）中不存在 → insert；
+//     主键已存在且任一列值不同 → update；
+//     主键已存在且所有列值完全相同（原样重复提交）→ 不产生记录；
 //   - Delete 仅当主键存在时产生一条 delete 记录（删除不存在的行不算变更）；
 //   - 记录中的 Row 为变更后的整行（缺省列已补齐）；delete 记录只带主键。
+//
+// 批次内同一主键多次出现时，逐条与"应用了本批次此前变更后的当前行"比较，
+// 因此同值连写只留一条记录，改值连写按发生顺序各留一条。
 func changeRecords(base []Row, schema Schema, batch Batch, snapID string, seq uint64) []ChangeRecord {
-	existing := map[string]bool{}
+	current := map[string]Row{} // pkKey -> 当前行（基线 + 本批次已应用的变更）
 	for _, r := range base {
 		if pk, ok := r[schema.PrimaryKey]; ok {
-			existing[pkKey(pk)] = true
+			current[pkKey(pk)] = r
 		}
 	}
 	var recs []ChangeRecord
@@ -87,19 +128,23 @@ func changeRecords(base []Row, schema Schema, batch Batch, snapID string, seq ui
 		case ch.Upsert != nil:
 			row := projectRow(*ch.Upsert, schema)
 			k := pkKey(row[schema.PrimaryKey])
+			old, existed := current[k]
+			if existed && rowsEqual(old, row, schema) {
+				continue // 值没有任何变化：不是真实变更，不留记录
+			}
 			op := OpInsert
-			if existing[k] {
+			if existed {
 				op = OpUpdate
 			}
-			existing[k] = true
+			current[k] = row
 			recs = append(recs, ChangeRecord{
 				Seq: seq, SnapshotID: snapID, Op: op,
 				Key: row[schema.PrimaryKey], Row: row,
 			})
 		case ch.Delete != nil:
 			k := pkKey(*ch.Delete)
-			if existing[k] {
-				delete(existing, k)
+			if _, ok := current[k]; ok {
+				delete(current, k)
 				recs = append(recs, ChangeRecord{
 					Seq: seq, SnapshotID: snapID, Op: OpDelete,
 					Key: *ch.Delete,

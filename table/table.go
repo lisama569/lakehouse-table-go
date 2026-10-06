@@ -16,11 +16,32 @@ type Table struct {
 }
 
 // CreateTable 创建新表，初始快照为空数据。
+//
+// 并发语义：多个实例、脚本或命令行工具同时创建同名表时，恰好一个成功，
+// 其余收到 ErrTableExists（与结构不兼容、数据非法、提交冲突均可区分）。
+// 存在性判定与初始快照落盘在同一个 flock 临界区内完成（先建锁文件再判定），
+// 因此被拒绝的一方不会改写已建好的结构与数据；无论并发多少、谁先谁后，
+// 最终表的结构与数据自洽（就是胜者那一份）。
 func CreateTable(store *Store, name string, schema Schema) (*Table, error) {
 	if err := validateSchema(schema); err != nil {
 		return nil, err
 	}
-	if store.tableExists(name) {
+	// 先取表级排他锁（会顺带建好 meta 目录与 LOCK 文件），
+	// 把 "判定表是否已建好 → 写初始快照 → 推进 HEAD" 整体串行化，
+	// 消除 check-then-act 竞态。
+	lk, err := store.lock(name)
+	if err != nil {
+		return nil, err
+	}
+	defer lk.unlock()
+
+	// 以 HEAD 是否已建立为准：HEAD 存在说明初始快照已完整落盘、表已生效。
+	// （不能用 meta 目录是否存在判定——本函数取锁时就会创建该目录。）
+	head, err := store.readHead(name)
+	if err != nil {
+		return nil, err
+	}
+	if head != "" {
 		return nil, fmt.Errorf("%w: %s", ErrTableExists, name)
 	}
 	if err := store.initTable(name); err != nil {
