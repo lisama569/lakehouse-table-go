@@ -71,14 +71,18 @@ func applyBatch(base []Row, schema Schema, batch Batch) []Row {
 
 // changeRecords 依据（基线, 批次）推导本批次真实发生的行级变更明细，
 // 顺序与变更在批次中的出现顺序一致，结果确定且可复现：
-//   - Upsert 的主键在基线（含本批次此前变更）中不存在 → insert，否则 → update；
-//   - Delete 仅当主键存在时产生一条 delete 记录（删除不存在的行不算变更）；
+//   - Upsert 的主键在基线（含本批次此前变更）中不存在 → insert；
+//     已存在但任一列值与当前行不同 → update；值完全相同 → 不产生记录；
+//   - Delete 仅当主键当前存在时产生一条 delete 记录（删除不存在的行不算变更）；
+//   - 同一批次内同一主键被写多次时，以"变更发生时刻的当前行"为准逐条判定，
+//     记录按发生顺序输出；
 //   - 记录中的 Row 为变更后的整行（缺省列已补齐）；delete 记录只带主键。
 func changeRecords(base []Row, schema Schema, batch Batch, snapID string, seq uint64) []ChangeRecord {
-	existing := map[string]bool{}
+	// 当前行（含本批次此前变更）的最新值，用于判定本次 Upsert 是否真的改变了数据。
+	current := map[string]Row{}
 	for _, r := range base {
 		if pk, ok := r[schema.PrimaryKey]; ok {
-			existing[pkKey(pk)] = true
+			current[pkKey(pk)] = r
 		}
 	}
 	var recs []ChangeRecord
@@ -87,19 +91,24 @@ func changeRecords(base []Row, schema Schema, batch Batch, snapID string, seq ui
 		case ch.Upsert != nil:
 			row := projectRow(*ch.Upsert, schema)
 			k := pkKey(row[schema.PrimaryKey])
-			op := OpInsert
-			if existing[k] {
-				op = OpUpdate
+			prev, existed := current[k]
+			if !existed {
+				recs = append(recs, ChangeRecord{
+					Seq: seq, SnapshotID: snapID, Op: OpInsert,
+					Key: row[schema.PrimaryKey], Row: row,
+				})
+			} else if !rowsEqual(prev, row, schema) {
+				recs = append(recs, ChangeRecord{
+					Seq: seq, SnapshotID: snapID, Op: OpUpdate,
+					Key: row[schema.PrimaryKey], Row: row,
+				})
 			}
-			existing[k] = true
-			recs = append(recs, ChangeRecord{
-				Seq: seq, SnapshotID: snapID, Op: op,
-				Key: row[schema.PrimaryKey], Row: row,
-			})
+			// 值相同则为原样重复提交：不产生任何记录，当前行也无需变化。
+			current[k] = row
 		case ch.Delete != nil:
 			k := pkKey(*ch.Delete)
-			if existing[k] {
-				delete(existing, k)
+			if _, ok := current[k]; ok {
+				delete(current, k)
 				recs = append(recs, ChangeRecord{
 					Seq: seq, SnapshotID: snapID, Op: OpDelete,
 					Key: *ch.Delete,
@@ -108,6 +117,42 @@ func changeRecords(base []Row, schema Schema, batch Batch, snapID string, seq ui
 		}
 	}
 	return recs
+}
+
+// rowsEqual 判定两行在给定结构的每一列上值是否相同。
+// 基线行来自 JSON 反序列化（整型列值为 float64），提交行是内存中的 int64，
+// 因此数值按数学值比较，避免序列化往返造成的假变更。
+func rowsEqual(a, b Row, schema Schema) bool {
+	for _, c := range schema.Columns {
+		if !valuesEqual(a[c.Name], b[c.Name]) {
+			return false
+		}
+	}
+	return true
+}
+
+// valuesEqual 判定两个单元格值是否相等；数值类型（int/int64/float64）按数值比较。
+func valuesEqual(a, b Value) bool {
+	an, aok := numericValue(a)
+	bn, bok := numericValue(b)
+	if aok && bok {
+		return an == bn
+	}
+	return a == b
+}
+
+// numericValue 把整型/浮点型值统一为 float64 比较；非数值返回 ok=false。
+func numericValue(v Value) (float64, bool) {
+	switch x := v.(type) {
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case float64:
+		return x, true
+	default:
+		return 0, false
+	}
 }
 
 // sortRows 按主键排序，保证读取结果可复现。

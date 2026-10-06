@@ -44,13 +44,13 @@ type Batch struct {
 
 // Snapshot 一个不可变快照的元数据。
 type Snapshot struct {
-	ID        string   `json:"id"`
-	Seq       uint64   `json:"seq"`
-	ParentID  string   `json:"parent_id"`
-	Schema    Schema   `json:"schema"`
-	DataFile  string   `json:"data_file"`
-	BatchID   string   `json:"batch_id"` // 产生本快照的批次；结构演进时为空
-	CreatedAt int64    `json:"created_at"`
+	ID        string `json:"id"`
+	Seq       uint64 `json:"seq"`
+	ParentID  string `json:"parent_id"`
+	Schema    Schema `json:"schema"`
+	DataFile  string `json:"data_file"`
+	BatchID   string `json:"batch_id"` // 产生本快照的批次；结构演进时为空
+	CreatedAt int64  `json:"created_at"`
 }
 
 // ChangeOp 行级变更类型。

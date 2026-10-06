@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"sync"
 	"time"
 )
@@ -16,13 +17,42 @@ type Table struct {
 }
 
 // CreateTable 创建新表，初始快照为空数据。
+//
+// 多个服务实例、脚本或命令行工具同时创建同名表时，只有一个真正建立成功并
+// 写入结构与初始数据；其余返回 ErrTableExists（与 ErrCommitConflict、
+// ErrSchemaIncompatible、ErrInvalidChange 可区分），且不会覆盖或改写
+// 先建成功者的结构与数据。
 func CreateTable(store *Store, name string, schema Schema) (*Table, error) {
 	if err := validateSchema(schema); err != nil {
 		return nil, err
 	}
-	if store.tableExists(name) {
+	// 快速路径：表已存在（HEAD 已就位）时直接拒绝，无需进入建表临界区。
+	if store.tableReady(name) {
 		return nil, fmt.Errorf("%w: %s", ErrTableExists, name)
 	}
+	// 原子占位：os.Mkdir 对同一目录是原子的，并发建表者中只有一个能创建
+	// meta 目录；目录已存在即说明有人先到（正在建或已建好）。
+	if err := os.MkdirAll(store.tableDir(name), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(store.metaDir(name), 0o755); err != nil &&
+		!errors.Is(err, fs.ErrExist) {
+		return nil, err
+	}
+
+	// 持表锁串行建表临界区（跨进程 flock）：等待先到者完成或失败。
+	lk, err := store.lock(name)
+	if err != nil {
+		return nil, err
+	}
+	defer lk.unlock()
+
+	if store.tableReady(name) {
+		// 先到者已把表完整建好：拒绝后来者，且后来者没有写入任何结构/数据。
+		return nil, fmt.Errorf("%w: %s", ErrTableExists, name)
+	}
+	// HEAD 尚未就位：持锁者负责完成建表。若先到者中途失败留下半成品目录，
+	// 后来者在此接手，避免同名表永远无法再创建。
 	if err := store.initTable(name); err != nil {
 		return nil, err
 	}
@@ -49,7 +79,7 @@ func CreateTable(store *Store, name string, schema Schema) (*Table, error) {
 
 // OpenTable 打开已存在的表。
 func OpenTable(store *Store, name string) (*Table, error) {
-	if !store.tableExists(name) {
+	if !store.tableReady(name) {
 		return nil, fmt.Errorf("%w: %s", ErrTableNotFound, name)
 	}
 	return &Table{store: store, name: name}, nil

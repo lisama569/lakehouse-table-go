@@ -88,6 +88,17 @@ func (s *Store) tableExists(name string) bool {
 	return err == nil && st.IsDir()
 }
 
+// tableReady 判断表是否已经完整建好：meta 目录存在且 HEAD 已写入。
+// 仅有 meta 目录占位（建表进行中或建表者中途失败）不算就绪，
+// 这样并发建表的后来者在持锁复查时能区分"已建好"与"半成品"。
+func (s *Store) tableReady(name string) bool {
+	if !s.tableExists(name) {
+		return false
+	}
+	head, err := s.readHead(name)
+	return err == nil && head != ""
+}
+
 // writeFileAtomic 先写临时文件再 rename，保证读取方不会看到部分写入。
 func writeFileAtomic(path string, data []byte) error {
 	tmp := path + ".tmp"
